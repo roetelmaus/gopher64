@@ -1,0 +1,395 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 05e1104..d28dfcc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2421,6 +2421,7 @@ dependencies = [
+  "slint",
+  "slint-build",
+  "spin_sleep",
++ "tempfile",
+  "time",
+  "tokio",
+  "tokio-tungstenite",
+diff --git a/Cargo.toml b/Cargo.toml
+index e97fee1..6e2caf4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,6 +41,7 @@ obfstr = { version = "0.4", optional = true }
+ rustls = { version = "0.23", default-features = false }
+ 
+ [target.'cfg(not(target_os = "android"))'.dependencies]
++tempfile = "3"
+ slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "unstable-winit-030", "backend-winit", "renderer-femtovg-wgpu", "accessibility"], optional = true }
+ rfd = {version = "0.18", optional = true }
+ dirs = "7.0"
+diff --git a/src/device/controller/gbcart.rs b/src/device/controller/gbcart.rs
+index 870c8a9..8be09f3 100644
+--- a/src/device/controller/gbcart.rs
++++ b/src/device/controller/gbcart.rs
+@@ -2,7 +2,9 @@ use crate::device;
+ #[cfg(target_os = "android")]
+ use crate::ui;
+ 
+-use std::io::{Read, Write};
++use std::io::Read;
++#[cfg(not(target_os = "android"))]
++use std::io::Write;
+ const MBC3_RTC_SECONDS: usize = 0;
+ const MBC3_RTC_MINUTES: usize = 1;
+ const MBC3_RTC_HOURS: usize = 2;
+@@ -16,6 +18,8 @@ pub struct GbCart {
+     #[serde(skip)]
+     pub rom: Vec<u8>,
+     pub ram: Vec<u8>,
++    #[serde(skip)]
++    pub write_pending: bool,
+     pub cart_type: device::controller::gbcart::CartType,
+     pub ram_enabled: bool,
+     pub mbc1_mode: bool,
+@@ -35,6 +39,7 @@ impl GbCart {
+             enabled,
+             rom: _,
+             ram,
++            write_pending,
+             cart_type,
+             ram_enabled,
+             mbc1_mode,
+@@ -47,6 +52,7 @@ impl GbCart {
+         } = other;
+         self.enabled = *enabled;
+         self.ram.clone_from(ram);
++        self.write_pending = *write_pending;
+         self.cart_type = *cart_type;
+         self.ram_enabled = *ram_enabled;
+         self.mbc1_mode = *mbc1_mode;
+@@ -155,57 +161,37 @@ fn resize_ram(gb_cart: &mut device::controller::gbcart::GbCart) {
+     }
+ }
+ 
+-pub fn save(
+-    gb_cart: &mut device::controller::gbcart::GbCart,
+-    elapsed_time: i64,
+-    ram_path: &std::string::String,
+-) {
+-    if cfg!(target_os = "android") {
+-        return;
+-    }
+-    update_rtc_regs(gb_cart, elapsed_time);
+-
+-    if let Ok(file) = std::fs::File::create(ram_path) {
+-        let mut f = std::io::BufWriter::new(file);
+-        f.write_all(&gb_cart.ram).unwrap();
+-
+-        if gb_cart.cart_type == CartType::MBC3RamBattRtc {
+-            f.write_all(&(gb_cart.rtc_regs[MBC3_RTC_SECONDS] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs[MBC3_RTC_MINUTES] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs[MBC3_RTC_HOURS] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs[MBC3_RTC_DAYS_L] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs[MBC3_RTC_DAYS_H] as u32).to_le_bytes())
+-                .unwrap();
+-
+-            f.write_all(&(gb_cart.rtc_regs_latch[MBC3_RTC_SECONDS] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs_latch[MBC3_RTC_MINUTES] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs_latch[MBC3_RTC_HOURS] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs_latch[MBC3_RTC_DAYS_L] as u32).to_le_bytes())
+-                .unwrap();
+-            f.write_all(&(gb_cart.rtc_regs_latch[MBC3_RTC_DAYS_H] as u32).to_le_bytes())
+-                .unwrap();
+-
+-            // rtc_regs are now in sync with rtc_base_time + elapsed_time. Emulated time can
+-            // run ahead of real time (fast forward). Clamp to now.
+-            let now = std::time::SystemTime::now()
+-                .duration_since(std::time::UNIX_EPOCH)
+-                .unwrap()
+-                .as_secs() as i64;
+-            let timestamp = (gb_cart.rtc_base_time + elapsed_time).min(now);
+-            f.write_all(&timestamp.to_le_bytes()).unwrap();
+-
+-            f.flush().unwrap();
++#[cfg(not(target_os = "android"))]
++pub fn save(cart: &GbCart, elapsed_time: i64, ram_path: &str) -> std::io::Result<()> {
++    use std::path::Path;
++
++    let path = Path::new(ram_path);
++    let parent = path
++        .parent()
++        .filter(|parent| !parent.as_os_str().is_empty())
++        .unwrap_or_else(|| Path::new("."));
++    let mut file = tempfile::NamedTempFile::new_in(parent)?;
++    file.write_all(&cart.ram)?;
++
++    if cart.cart_type == CartType::MBC3RamBattRtc {
++        let mut rtc_regs = cart.rtc_regs;
++        advance_rtc(&mut rtc_regs, elapsed_time - cart.last_elapsed_time);
++        for value in rtc_regs.into_iter().chain(cart.rtc_regs_latch) {
++            file.write_all(&u32::from(value).to_le_bytes())?;
+         }
+-    } else {
+-        eprintln!("Error saving TransferPak RAM to {ram_path}");
++
++        // Emulated time can run ahead of real time during fast forward.
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let timestamp = (cart.rtc_base_time + elapsed_time).min(now);
++        file.write_all(&timestamp.to_le_bytes())?;
+     }
++
++    file.as_file().sync_all()?;
++    file.persist(path)?;
++    Ok(())
+ }
+ 
+ fn update_rtc_regs(cart: &mut device::controller::gbcart::GbCart, elapsed_time: i64) {
+@@ -264,14 +250,18 @@ fn read_ram(pif_ram: &mut [u8], ram: &[u8], offset: usize, data: usize, size: us
+     }
+ }
+ 
+-fn write_ram(pif_ram: &[u8], ram: &mut [u8], offset: usize, data: usize, size: usize) {
+-    if ram.is_empty() {
+-        return;
+-    }
++fn write_ram(pif_ram: &[u8], ram: &mut [u8], offset: usize, data: usize, size: usize) -> bool {
+     let len = ram.len();
+-    for i in 0..size {
+-        ram[(offset + i) % len] = pif_ram[data + i];
++    if len == 0 {
++        return false;
++    }
++    let mut changed = false;
++    for (i, &value) in pif_ram[data..data + size].iter().enumerate() {
++        let byte = &mut ram[(offset + i) % len];
++        changed |= *byte != value;
++        *byte = value;
+     }
++    changed
+ }
+ 
+ fn fill(pif_ram: &mut [u8], data: usize, size: usize, value: u8) {
+@@ -297,7 +287,7 @@ fn write_mbc1(
+     address: u16,
+     data: usize,
+     size: usize,
+-) {
++) -> bool {
+     let value = pif_ram[data + size - 1];
+     if address < 0x2000 {
+         cart.ram_enabled = value & 0xf == 0xa;
+@@ -313,11 +303,12 @@ fn write_mbc1(
+         cart.mbc1_mode = (value & 0x1) != 0;
+     } else if (0xa000..0xc000).contains(&address) {
+         if !cart.ram_enabled {
+-            return;
++            return false;
+         }
+         let offset = ram_offset(mbc1_ram_bank(cart), address);
+-        write_ram(pif_ram, &mut cart.ram, offset, data, size);
++        return write_ram(pif_ram, &mut cart.ram, offset, data, size);
+     }
++    false
+ }
+ 
+ fn read_mbc1(
+@@ -354,7 +345,7 @@ fn write_mbc3(
+     data: usize,
+     size: usize,
+     elapsed_time: i64,
+-) {
++) -> bool {
+     let value = pif_ram[data + size - 1];
+     if address < 0x2000 {
+         cart.ram_enabled = value & 0xf == 0xa;
+@@ -373,18 +364,22 @@ fn write_mbc3(
+         }
+     } else if (0xa000..0xc000).contains(&address) {
+         if !cart.ram_enabled {
+-            return;
++            return false;
+         }
+         if cart.ram_bank < 0x8 {
+             let offset = ram_offset(cart.ram_bank, address);
+-            write_ram(pif_ram, &mut cart.ram, offset, data, size);
++            return write_ram(pif_ram, &mut cart.ram, offset, data, size);
+         } else if cart.cart_type == CartType::MBC3RamBattRtc && cart.ram_bank <= 0xc {
+             update_rtc_regs(cart, elapsed_time);
+-            cart.rtc_regs[cart.ram_bank as usize - 0x8] = value;
++            let reg = &mut cart.rtc_regs[cart.ram_bank as usize - 0x8];
++            let changed = *reg != value;
++            *reg = value;
++            return changed;
+         }
+     } else {
+         panic!("Unsupported write address {address:x}");
+     }
++    false
+ }
+ 
+ fn read_mbc3(
+@@ -429,7 +424,7 @@ fn write_mbc5(
+     address: u16,
+     data: usize,
+     size: usize,
+-) {
++) -> bool {
+     let value = pif_ram[data + size - 1];
+     if address < 0x2000 {
+         cart.ram_enabled = value & 0xf == 0xa;
+@@ -445,13 +440,14 @@ fn write_mbc5(
+         // no MBC5 register here
+     } else if (0xa000..0xc000).contains(&address) {
+         if !cart.ram_enabled {
+-            return;
++            return false;
+         }
+         let offset = ram_offset(cart.ram_bank, address);
+-        write_ram(pif_ram, &mut cart.ram, offset, data, size);
++        return write_ram(pif_ram, &mut cart.ram, offset, data, size);
+     } else {
+         panic!("Unsupported write address {address:x}");
+     }
++    false
+ }
+ 
+ fn read_mbc5(
+@@ -512,9 +508,9 @@ pub fn write(
+     data: usize,
+     size: usize,
+     elapsed_time: i64,
+-) {
++) -> bool {
+     if !cart.enabled {
+-        return;
++        return false;
+     }
+     match cart.cart_type {
+         CartType::MBC1RamBatt => write_mbc1(pif_ram, cart, address, data, size),
+diff --git a/src/device/controller/transferpak.rs b/src/device/controller/transferpak.rs
+index eb4e76e..9b12aa7 100644
+--- a/src/device/controller/transferpak.rs
++++ b/src/device/controller/transferpak.rs
+@@ -1,4 +1,5 @@
+ use crate::device;
++use crate::ui;
+ 
+ #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+ pub struct TransferPak {
+@@ -134,7 +135,7 @@ pub fn write(device: &mut device::Device, channel: usize, address: u16, data: us
+             }
+         }
+         0xC..=0xF => {
+-            device::controller::gbcart::write(
++            let changed = device::controller::gbcart::write(
+                 &device.pif.ram,
+                 &mut pak.cart,
+                 0x4000 * pak.bank + (address & 0x3fff),
+@@ -142,9 +143,53 @@ pub fn write(device: &mut device::Device, channel: usize, address: u16, data: us
+                 size,
+                 device.vi.elapsed_time as i64,
+             );
++            if changed
++                && !cfg!(target_os = "android")
++                && device.netplay.is_none()
++                && !device.ui.config.input.gb_ram_path[channel].is_empty()
++            {
++                pak.cart.write_pending = true;
++                ui::storage::schedule_save_event(device);
++            }
+         }
+         _ => {
+             eprintln!("unknown transfer pak write {:x}", address >> 12);
+         }
+     }
+ }
++
++pub fn write_saves(device: &mut device::Device, force: bool) {
++    #[cfg(target_os = "android")]
++    let _ = (device, force);
++
++    #[cfg(not(target_os = "android"))]
++    {
++        if device.netplay.is_some() {
++            return;
++        }
++
++        let mut retry = false;
++        for (channel, pak) in device.transferpaks.iter_mut().enumerate() {
++            let path = &device.ui.config.input.gb_ram_path[channel];
++            if !device.ui.config.input.transfer_pak[channel]
++                || path.is_empty()
++                || pak.cart.ram.is_empty()
++                || (!force && !pak.cart.write_pending)
++            {
++                continue;
++            }
++
++            match device::controller::gbcart::save(&pak.cart, device.vi.elapsed_time as i64, path) {
++                Ok(()) => pak.cart.write_pending = false,
++                Err(error) => {
++                    eprintln!("Error saving TransferPak RAM to {path}: {error}");
++                    retry = true;
++                }
++            }
++        }
++
++        if retry && !force {
++            ui::storage::schedule_save_event(device);
++        }
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 61ae067..906e76c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -277,20 +277,7 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
+         #[cfg(not(target_os = "android"))]
+         retroachievements::shutdown_client();
+ 
+-        if device.netplay.is_none() {
+-            for i in 0..4 {
+-                if device.ui.config.input.transfer_pak[i]
+-                    && !device.ui.config.input.gb_ram_path[i].is_empty()
+-                    && !device.transferpaks[i].cart.ram.is_empty()
+-                {
+-                    device::controller::gbcart::save(
+-                        &mut device.transferpaks[i].cart,
+-                        device.vi.elapsed_time as i64,
+-                        &device.ui.config.input.gb_ram_path[i],
+-                    );
+-                }
+-            }
+-        }
++        device::controller::transferpak::write_saves(&mut device, true);
+ 
+         ui::usb::close(shutdown_tx, usb_handle);
+     } else if arg_count > 1 {
+diff --git a/src/ui/storage.rs b/src/ui/storage.rs
+index 0fe2469..b935ee9 100644
+--- a/src/ui/storage.rs
++++ b/src/ui/storage.rs
+@@ -477,6 +477,7 @@ pub fn write_saves(device: &mut device::Device) {
+ 
+ pub fn save_event(device: &mut device::Device) {
+     write_saves(device);
++    device::controller::transferpak::write_saves(device, false);
+ }
+ 
+ pub fn schedule_save(device: &mut device::Device, save_type: SaveTypes) {
+@@ -503,6 +504,10 @@ pub fn schedule_save(device: &mut device::Device, save_type: SaveTypes) {
+             device.ui.storage.saves.romsave.write_pending = true;
+         }
+     }
++    schedule_save_event(device);
++}
++
++pub fn schedule_save_event(device: &mut device::Device) {
+     device::events::create_event(
+         device,
+         device::events::EVENT_TYPE_SAVE,
